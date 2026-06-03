@@ -446,7 +446,7 @@ def window_pattern_matches(title: str, pattern: str) -> bool:
     if "*" in pattern_lower or "?" in pattern_lower:
         return fnmatch.fnmatchcase(title_lower, pattern_lower)
 
-    return pattern_lower in title_lower
+    return pattern_lower == title_lower
 
 
 def find_window_by_pattern(gw, pattern: str):
@@ -613,12 +613,14 @@ class GuiBridge:
         try:
             if self.pywin32_available:
                 hwnd = win._hWnd
+                # Better leave the window the way the user have it.
                 #self.win32gui.ShowWindow(hwnd, self.win32con.SW_RESTORE)
                 self.win32gui.ShowWindow(hwnd, self.win32con.SW_SHOW)
                 time.sleep(0.5)
                 self.win32gui.SetForegroundWindow(hwnd)
                 time.sleep(self.config.activation_delay)
             else:
+                # Better leave the window the way the user have it.
                 #win.restore()
                 win.activate()
                 time.sleep(self.config.activation_delay)
