@@ -510,7 +510,7 @@ def complete_link_action(md_path: Path, action: PendingAction, app_config: dict)
 
         config = build_agent_config(app_config, agent_name)
         candidate = GuiBridge(config, action.window_pattern)
-        if candidate.find_and_activate_window():
+        if candidate.remember_and_activate_window(win):
             gui_bridge = candidate
             result_line = f'<!-- connected to {agent_name} client "{actual_title}". -->'
     except Exception as exc:
@@ -569,6 +569,7 @@ class GuiBridge:
     def __init__(self, config: GuiConfig, window_pattern: str):
         self.config = config
         self.window_pattern = window_pattern
+        self.win = None
         self.pyautogui = None
         self.gw = None
         self.win32gui = None
@@ -604,12 +605,7 @@ class GuiBridge:
     def log(self, msg: str) -> None:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
-    def find_and_activate_window(self):
-        win = find_window_by_pattern(self.gw, self.window_pattern)
-        if not win:
-            self.log(f"Window not found: {self.window_pattern}")
-            return None
-
+    def activate_window(self, win):
         try:
             if self.pywin32_available:
                 hwnd = win._hWnd
@@ -632,6 +628,16 @@ class GuiBridge:
             return win
         except Exception:
             return win
+
+    def remember_and_activate_window(self, win):
+        self.win = win
+        return self.activate_window(win)
+
+    def activate_linked_window(self):
+        if not self.win:
+            self.log("No linked window is cached")
+            return None
+        return self.activate_window(self.win)
 
     def press_key_or_hotkey(self, key_spec: str) -> None:
         keys = [key.strip() for key in key_spec.split("+") if key.strip()]
@@ -793,7 +799,7 @@ class GuiBridge:
 
     def capture_latest_response(self) -> str | None:
         self.log("Starting agent response capture")
-        win = self.find_and_activate_window()
+        win = self.activate_linked_window()
         if not win:
             return None
 
@@ -855,7 +861,7 @@ class GuiBridge:
 
     def send_prompt_to_agent(self, prompt: str) -> bool:
         self.log(f"Sending prompt: {prompt[:70]}{'...' if len(prompt) > 70 else ''}")
-        win = self.find_and_activate_window()
+        win = self.activate_linked_window()
         if not win:
             return False
 
