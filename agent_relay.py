@@ -606,12 +606,13 @@ class GuiBridge:
         try:
             if self.pywin32_available:
                 hwnd = win._hWnd
-                self.win32gui.ShowWindow(hwnd, self.win32con.SW_RESTORE)
+                #self.win32gui.ShowWindow(hwnd, self.win32con.SW_RESTORE)
+                self.win32gui.ShowWindow(hwnd, self.win32con.SW_SHOW)
                 time.sleep(0.5)
                 self.win32gui.SetForegroundWindow(hwnd)
                 time.sleep(self.config.activation_delay)
             else:
-                win.restore()
+                #win.restore()
                 win.activate()
                 time.sleep(self.config.activation_delay)
 
@@ -922,8 +923,7 @@ def main() -> None:
 
     # If the file is empty or trivially containing only whitespace, also call write_new_md() to add the initial template with title and timestamp
     if md_path.stat().st_size == 0 or md_path.read_text(encoding="utf-8").strip() == "":
-        write_new_md(md_path, title)
-
+        write_new_md(md_path, '')
     gui_bridge = None
 
     print(f"agent_relay started - Monitoring: {md_path}")

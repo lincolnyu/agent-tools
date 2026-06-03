@@ -2,15 +2,18 @@ param(
     [string]$InputArg
 )
 
+# This script is assumed to be in the same folder as the agent_relay.py script. We need to get the path to that folder to run the python script.
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+
 # check if $InputArg is an existing file name:
 if (-not (Test-Path $InputArg)) {
 
     # if $InputArg ends with .md:
     if (-not ($InputArg -match '\.md$')) {
         # Run create command and capture all output
-        $output = & python agent_relay.py --create $InputArg | Out-String
+        $output = & python "$scriptDir\agent_relay.py" --create $InputArg | Out-String
     } else {
-        $output = & python agent_relay.py --create "" $InputArg | Out-String
+        $output = & python "$scriptDir\agent_relay.py" --create "" $InputArg | Out-String
     }
 
     # Extract only the filename - we look for the last line that looks like a .md file path
@@ -30,7 +33,6 @@ if (-not (Test-Path $InputArg)) {
 
     Write-Host "File created: $filename" -ForegroundColor Green
 
-
 } else {
     $filename = $InputArg
     Write-Host "File already exists: $filename" -ForegroundColor Yellow
@@ -41,4 +43,5 @@ code "$filename"
 
 # Run the main command
 Write-Host "Running agent..." -ForegroundColor Cyan
-python agent_relay.py "$filename"
+
+python "$scriptDir\agent_relay.py" "$filename"
