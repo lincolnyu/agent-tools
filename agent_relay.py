@@ -380,10 +380,17 @@ def enumerate_images(directory: Path, prefix: str) -> list[Path]:
 
 
 def image_click_offset(path: Path) -> tuple[int, int]:
-    match = re.search(r"-(-?\d+),(-?\d+)$", path.stem)
+    match = re.search(r"-(-?\d+),(-?\d+)(?:,[+-]?(?:\d+(?:\.\d*)?|\.\d+))?$", path.stem)
     if not match:
         return 0, 0
     return int(match.group(1)), int(match.group(2))
+
+
+def image_match_confidence(path: Path, default: float) -> float:
+    match = re.search(r"-(-?\d+),(-?\d+),([+-]?(?:\d+(?:\.\d*)?|\.\d+))$", path.stem)
+    if not match:
+        return default
+    return float(match.group(3))
 
 
 def build_agent_config(app_config: dict, agent_name: str) -> "GuiConfig":
@@ -651,9 +658,10 @@ class GuiBridge:
         for path in found_input_templates:
             for _ in range(self.config.max_retries):
                 try:
+                    confidence = image_match_confidence(path, self.config.confidence)
                     location = self.pyautogui.locateOnScreen(
                         str(path),
-                        confidence=self.config.confidence,
+                        confidence=confidence,
                         region=region,
                     )
                     if location:
@@ -691,9 +699,10 @@ class GuiBridge:
     def locate_and_click(self, template_path: Path, action_name: str, region=None) -> bool:
         for _ in range(self.config.max_retries):
             try:
+                confidence = image_match_confidence(template_path, self.config.confidence)
                 location = self.pyautogui.locateOnScreen(
                     str(template_path),
-                    confidence=self.config.confidence,
+                    confidence=confidence,
                     region=region,
                 )
                 if location:
@@ -733,9 +742,10 @@ class GuiBridge:
             try:
                 matches = []
                 for path in self.config.copy_buttons:
+                    confidence = image_match_confidence(path, self.config.confidence)
                     for box in self.pyautogui.locateAllOnScreen(
                         str(path),
-                        confidence=self.config.confidence,
+                        confidence=confidence,
                         grayscale=False,
                         region=region,
                     ):
