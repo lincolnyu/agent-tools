@@ -747,9 +747,9 @@ class GuiBridge:
         region = (win.left, win.top, win.width, region_height)
 
         def choose_candidate():
-            try:
-                matches = []
-                for path in self.config.copy_buttons:
+            matches = []
+            for path in self.config.copy_buttons:
+                try:
                     confidence = image_match_confidence(path, self.config.confidence)
                     for box in self.pyautogui.locateAllOnScreen(
                         str(path),
@@ -758,9 +758,8 @@ class GuiBridge:
                         region=region,
                     ):
                         matches.append((box, path))
-            except Exception as exc:
-                self.log(f"Locate error (Copy above input): {exc}")
-                return None
+                except Exception as exc:
+                    self.log(f"Locate error (Copy above input): {exc}")
 
             # The button normally should be also on the left side of the input box. There are distracting ones on the right and they should definitely be excluded.
             # Review and revise this when an exception has been found.
