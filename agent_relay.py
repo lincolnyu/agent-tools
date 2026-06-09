@@ -155,6 +155,10 @@ def response_pending_marker(action_id: str) -> str:
     return RESPONSE_PENDING.format(action_id=action_id)
 
 
+def link_pending_marker(action: PendingAction) -> str:
+    return f'<!-- linking to client "{action.window_pattern}"... {MARKER_PREFIX}:link-pending:{action.action_id} -->'
+
+
 def process_say_tags(content: str, action_start_index: int = 0) -> tuple[str, bool, str, list[PendingAction]]:
     """Process only complete <isay> blocks."""
     modified = False
@@ -228,32 +232,54 @@ def extract_prompt_from_marked_block(block: str) -> str:
     return "\n".join(lines).strip()
 
 
-def retry_last_prompt(content: str, action_start_index: int = 0) -> tuple[str, bool, list[PendingAction]]:
-    if "<iretry/>" not in content:
-        return content, False, []
+def process_retry_tags(content: str, action_start_index: int = 0) -> tuple[str, bool, list[PendingAction]]:
+    """Restore <iretry> blocks and append the first retryable action."""
+    pattern = re.compile(r"<iretry>(.*?)</iretry>", re.DOTALL)
+    changed = False
+    actions = []
+    appended = []
 
-    retry_index = content.find("<iretry/>")
-    search_area = content[:retry_index]
-    begin_marker, end_marker, begin = latest_prompt_marker(search_area)
-    end = search_area.find(end_marker, begin) if begin != -1 else -1
+    def replace_retry(match: re.Match) -> str:
+        nonlocal changed
+        block = match.group(1)
+        changed = True
 
-    if begin == -1 or end == -1 or end > retry_index:
-        return content.replace("<iretry/>", "> unable to retry: no previous prompt found.", 1), True, []
+        if actions:
+            return block
 
-    prompt_block_start = begin + len(begin_marker)
-    prompt = extract_prompt_from_marked_block(search_area[prompt_block_start:end])
-    if not prompt:
-        return content[:end + len(end_marker)] + "\n\n> unable to retry: previous prompt was empty.\n", True, []
+        action_id = make_action_id("retry", action_start_index + len(actions))
+        parsed_block = block.strip()
 
-    kept = content[: end + len(end_marker)].rstrip()
-    action_id = make_action_id("retry", action_start_index)
-    action = PendingAction(kind="retry", action_id=action_id, prompt=prompt)
-    return kept + "\n" + response_pending_marker(action_id), True, [action]
+        if PROMPT_BEGIN in parsed_block and PROMPT_END in parsed_block:
+            prompt = extract_prompt_from_marked_block(parsed_block)
+            if prompt:
+                actions.append(PendingAction(kind="retry", action_id=action_id, prompt=prompt))
+                appended.append(f"{format_followup_prompt(prompt)}\n{response_pending_marker(action_id)}")
+                return block
 
+        link_match = re.search(r'connected to\s+(\w+)\s+client "([^"]+)"', parsed_block)
+        if link_match:
+            agent_name = link_match.group(1).strip().lower()
+            window_pattern = link_match.group(2).strip()
+            action = PendingAction(
+                kind="link",
+                action_id=action_id,
+                window_pattern=window_pattern,
+                agent_name=agent_name,
+            )
+            actions.append(action)
+            appended.append(link_pending_marker(action))
+            return block
 
-def latest_prompt_marker(content: str) -> tuple[str, str, int]:
-    current_begin = content.rfind(PROMPT_BEGIN)
-    return PROMPT_BEGIN, PROMPT_END, current_begin
+        return block
+
+    new_content = pattern.sub(replace_retry, content)
+    if changed and not appended:
+        appended.append("> retry failed: no recognizable action found inside block.")
+    if appended:
+        new_content = f"{new_content.rstrip()}\n\n{appended[0]}"
+    return new_content, changed, actions
+
 
 def parse_tag_attrs(attr_text: str) -> dict[str, str]:
     return {key: value for key, value in re.findall(r"(\w+)=\"([^\"]*)\"", attr_text)}
@@ -475,6 +501,36 @@ def guess_agent_name(pattern: str, actual_title: str) -> tuple[str | None, str |
     return None, f"ambiguous agent type: {', '.join(unique_matches)}"
 
 
+def restore_gui_bridge_from_connected_comment(md_path: Path, app_config: dict):
+    content = md_path.read_text(encoding="utf-8")
+    matches = list(re.finditer(r'<!-- connected to\s+(\w+)\s+client "([^"]+)". -->', content))
+    if not matches:
+        return None
+
+    agent_name = matches[-1].group(1).strip().lower()
+    window_pattern = matches[-1].group(2).strip()
+
+    try:
+        import pygetwindow as gw
+
+        if agent_name not in SUPPORTED_AGENTS:
+            raise RuntimeError(f'unsupported agent type: "{agent_name}"')
+
+        win = find_window_by_pattern(gw, window_pattern)
+        if not win:
+            raise RuntimeError(f'window not found: "{window_pattern}"')
+
+        config = build_agent_config(app_config, agent_name)
+        candidate = GuiBridge(config, window_pattern)
+        if candidate.remember_and_activate_window(win):
+            print(f'Restored link to {agent_name} client "{get_window_title(win)}".')
+            return candidate
+    except Exception as exc:
+        print(f"Restore link failed: {exc}")
+
+    return None
+
+
 def complete_send_action(md_path: Path, action: PendingAction, gui_bridge, expected_hash: str) -> None:
     answer = send_and_capture(gui_bridge, action.prompt, md_path=md_path, expected_hash=expected_hash)
     if get_file_hash(md_path) != expected_hash:
@@ -486,7 +542,7 @@ def complete_send_action(md_path: Path, action: PendingAction, gui_bridge, expec
 
 
 def complete_link_action(md_path: Path, action: PendingAction, app_config: dict) -> object | None:
-    pending_line = f'<!-- linking to client "{action.window_pattern}"... {MARKER_PREFIX}:link-pending:{action.action_id} -->'
+    pending_line = link_pending_marker(action)
     result_line = f'<!-- unable to link to client "{action.window_pattern}". -->'
     gui_bridge = None
 
@@ -531,6 +587,8 @@ def complete_pending_actions(md_path: Path, actions: list[PendingAction], gui_br
                 gui_bridge = linked_bridge
             current_expected_hash = get_file_hash(md_path)
         elif action.kind in {"say", "retry"}:
+            if not gui_bridge:
+                gui_bridge = restore_gui_bridge_from_connected_comment(md_path, app_config)
             complete_send_action(md_path, action, gui_bridge, current_expected_hash)
             current_expected_hash = get_file_hash(md_path)
     return gui_bridge
@@ -970,7 +1028,7 @@ def main() -> None:
                 content, link_changed, link_actions = process_link_tags(content, action_start_index=len(actions))
                 actions.extend(link_actions)
 
-                content, retry_changed, retry_actions = retry_last_prompt(content, action_start_index=len(actions))
+                content, retry_changed, retry_actions = process_retry_tags(content, action_start_index=len(actions))
                 actions.extend(retry_actions)
 
                 content, resp_changed, say_actions = process_say_tags(
