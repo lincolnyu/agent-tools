@@ -28,7 +28,7 @@ The whole workflow revolves around one evolving document, `topic.md`:
 
 ```
    topic.md ──(2)──> topic.out.md ──you──> chat ──you──> topic.diff.md
-      ^                  + repo zips                          │
+      ^               + topic-files/                          │
       └──────────────────────(3)──────────────────────────────┘
                      (+ topic.patch, topic.bak.md)
 ```
@@ -79,11 +79,20 @@ prompt you paste into the chat. It contains:
 - **`<<<INSTRUCTIONS>>>`** — tells the agent to reply in exactly two sections,
   `<<<Agent Answer>>>` and `<<<Code diff>>>` (a `git diff -U3`-style unified diff,
   or "No code changes this turn.").
-- **`<<<ATTACHED REPOS>>>`** — lists the zip file for each referenced repo.
+- **`<<<ATTACHED FILES>>>`** — lists everything in the `topic-files/` folder
+  (repo zips + anything you added), annotating which entries are repo archives.
 - **The current working document**, embedded verbatim so the agent sees all prior
   answers and your feedback.
 
-Alongside it, each referenced repo is zipped:
+The attachments live in a folder named after the doc — `topic.md` → **`topic-files/`**
+— created next to it. This folder is a **persistent outbox**: the tool refreshes
+the repo zips there every round but never deletes anything, so files you drop in
+manually (and prior ones) survive across rounds. You're responsible for referencing
+any manual files in the doc where it matters; the tool just lists them so nothing
+is silently attached. `topic.out.md` itself stays at top level — it's the text you
+paste, the folder is what you attach.
+
+Each referenced repo is zipped into `topic-files/`:
 
 - If the path is a **git repo**, the zip contains exactly what git does *not*
   ignore — tracked **and** untracked files, honoring every `.gitignore` layer,
@@ -94,7 +103,7 @@ Alongside it, each referenced repo is zipped:
   not being respected.
 
 On Windows the packet is also copied to the clipboard for convenience. The tool
-prints the exact zip filenames to attach to your chat message.
+prints the exact files to attach from `topic-files/`.
 
 ## Step 3 — folding the reply back in
 
@@ -120,7 +129,7 @@ Then edit `topic.md`: add your feedback in the `<<<Feedback>>>` stub, and loop.
 |---|---|
 | `topic.md` | The evolving working document (you own and edit it). |
 | `topic.out.md` | Generated packet to paste into the chat. |
-| `<label>_<repo>.zip` | Generated repo archive(s) to attach. |
+| `topic-files/` | Persistent outbox to attach: repo zips (refreshed each round) + any files you add. |
 | `topic.diff.md` | The agent's raw reply you save (consumed in step 3). |
 | `topic.patch` | Proposed code changes to review and apply by hand. |
 | `topic.bak.md` | Backup of `topic.md` from before the last merge. |

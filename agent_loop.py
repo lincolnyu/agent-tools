@@ -144,16 +144,22 @@ def produce_out(a_path: Path):
     a_content = a_path.read_text(encoding="utf-8")
     refs = parse_code_refs(extract_section(a_content, "Code"))
 
-    # Zip referenced repos first so we can list them in the packet.
-    attached = []
+    # Persistent outbox: repo zips are refreshed here each round, and the user
+    # may drop extra files in too. Nothing here is ever deleted by the tool.
+    files_dir = a_path.with_name(a_path.stem + "-files")
+    files_dir.mkdir(exist_ok=True)
+
+    repo_zips = {}  # zip filename -> source repo path
     for label, repo in refs:
         if not Path(repo).exists():
             print(f"⚠️  Repo path {repo} not found; skipping")
             continue
         base = re.sub(r'[^a-zA-Z0-9_.-]', '_', Path(repo).name) or "repo"
         zip_name = f"{label}_{base}.zip"
-        if zip_repo(repo, zip_name):
-            attached.append((label, repo, zip_name))
+        if zip_repo(repo, str(files_dir / zip_name)):
+            repo_zips[zip_name] = repo
+
+    attached = sorted(p.name for p in files_dir.iterdir() if p.is_file())
 
     out = f"""# AGENT LOOP PACKET for {a_path.name}
 Generated: {datetime.now().isoformat()}
@@ -176,12 +182,16 @@ no code changes, write "No code changes this turn."
 """
 
     if attached:
-        out += "\n<<<ATTACHED REPOS>>>\n"
-        out += ("The referenced repositories are attached to this message as zip files "
-                "(directories like .git/node_modules are excluded). Unzip and inspect "
-                "them as needed; diffs should apply from each repo's root.\n")
-        for label, repo, zip_name in attached:
-            out += f"- {label}: {zip_name}  (from {repo})\n"
+        out += "\n<<<ATTACHED FILES>>>\n"
+        out += (f"The following files are attached to this message (from the "
+                f"{files_dir.name}/ folder). Repo zips hold the working tree with "
+                f".gitignore respected; unzip and inspect as needed, and apply diffs "
+                f"from each repo's root.\n")
+        for name in attached:
+            if name in repo_zips:
+                out += f"- {name}  (repo: {repo_zips[name]})\n"
+            else:
+                out += f"- {name}\n"
 
     out += "\n--- WORKING DOCUMENT (current state) ---\n\n" + a_content.rstrip() + "\n"
 
@@ -191,7 +201,7 @@ no code changes, write "No code changes this turn."
     if copy_to_clipboard(out):
         print("📋 Copied packet to clipboard")
     if attached:
-        print("Attach these zips to your message: " + ", ".join(z for _, _, z in attached))
+        print(f"📎 Attach the files in {files_dir.name}/ : " + ", ".join(attached))
 
 
 def integrate(a_path: Path, diff_path: Path):
