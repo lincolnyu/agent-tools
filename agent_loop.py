@@ -1,468 +1,246 @@
 #!/usr/bin/env python3
 """
-agent_loop.py - standalone prompt packet compiler and response integrator.
+agent_loop.py - a manual, human-in-the-loop "agent loop".
+
+A file-shuttling helper for iterating with an external LLM chat agent you
+cannot script (a web UI like Grok/ChatGPT). Instead of an API you pass
+Markdown files back and forth. The naming convention is A -> B -> C -> A(n+1):
+
+  A(n)  Your human-readable prompt doc: <<<Original State>>> (the task) and
+        <<<Code>>> (references to repos, e.g. `- code1: path/to/repo`).
+  B(n)  A compiled packet you paste into the external agent. It embeds the
+        instructions, the required response format and the current A, and
+        zips each referenced repo so you can attach them.
+  C(n)  The agent's raw reply, saved to a file. It must contain
+        <<<Agent Answer>>> and <<<Code diff>>> (git-apply-able unified diff).
+  A(n+1)  Produced by folding C's answer + diff back into A, numbered per
+        round, so you can review, add <<<Feedback n>>>, and loop again.
 
 Usage:
-  python agent_loop.py A1.md
-      Produce B1: a pasteable prompt packet for an external agent.
-
-  python agent_loop.py A1.md C1.txt
-      Produce A2.md: the next human-readable prompt document from the
-      external agent response.
+  python agent_loop.py --template some.A.md   # scaffold a fresh A
+  python agent_loop.py some.A.md              # produce B (+ repo zips)
+  python agent_loop.py some.A.md some.C.md    # integrate C -> next A
 """
 
-from __future__ import annotations
-
 import argparse
-import json
-import mimetypes
+import os
 import re
 import subprocess
 import sys
-from dataclasses import dataclass
-from datetime import datetime
+import zipfile
 from pathlib import Path
-from typing import Iterable
+from datetime import datetime
 
+# Windows consoles default to cp1252, which can't encode the ✅/📋 status glyphs.
 try:
-    import pyperclip
+    sys.stdout.reconfigure(encoding="utf-8")
+except (AttributeError, ValueError):
+    pass
 
-    CLIPBOARD_AVAILABLE = True
-except ImportError:
-    pyperclip = None
-    CLIPBOARD_AVAILABLE = False
-
-
-MAX_INLINE_CHARS = 12000
-DEFAULT_INCLUDE_GLOBS = (
-    "*.cs",
-    "*.csproj",
-    "*.sln",
-    "*.py",
-    "*.ps1",
-    "*.js",
-    "*.jsx",
-    "*.ts",
-    "*.tsx",
-    "*.json",
-    "*.yml",
-    "*.yaml",
-    "*.toml",
-    "*.xml",
-    "*.html",
-    "*.css",
-    "*.md",
-    "*.txt",
-    "*.sql",
-    "*.sh",
-    "*.bat",
-)
-
-BEGIN_MARKER = "<<<AGENT_LOOP_RESPONSE_BEGIN>>>"
-END_MARKER = "<<<AGENT_LOOP_RESPONSE_END>>>"
-NEXT_A_BEGIN = "<<<NEXT_A_MARKDOWN_BEGIN>>>"
-NEXT_A_END = "<<<NEXT_A_MARKDOWN_END>>>"
-DIFF_BEGIN = "<<<GIT_DIFF_BEGIN>>>"
-DIFF_END = "<<<GIT_DIFF_END>>>"
-NOTES_BEGIN = "<<<NOTES_BEGIN>>>"
-NOTES_END = "<<<NOTES_END>>>"
+EXCLUDE_DIRS = {'.git', 'node_modules', '__pycache__', 'venv', 'env', 'dist', 'build', '.venv'}
+EXCLUDE_FILES = {'.DS_Store'}
 
 
-@dataclass
-class FileReference:
-    raw: str
-    resolved: Path
-    exists: bool
-    size: int = 0
-    inline: bool = False
-    reason: str = ""
-    content: str = ""
+def generate_template(output_path: Path):
+    template = """<<<Original State>>>
+Describe your question / task here in detail.
+Be specific about goals, constraints, and what success looks like.
+Reference code repos using code1, code2, etc.
+
+<<<Code>>>
+- code1: path/to/first/repo
+- code2: path/to/second/repo (if needed)
+"""
+
+    output_path.write_text(template, encoding="utf-8")
+    print(f"✅ Template generated: {output_path}")
+    print(f"Edit it, then run: python agent_loop.py {output_path}")
 
 
-def read_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8-sig")
-
-
-def write_text(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content.rstrip() + "\n", encoding="utf-8")
-
-
-def is_probably_text(path: Path) -> bool:
-    mime, _ = mimetypes.guess_type(str(path))
-    if mime and (mime.startswith("text/") or mime in {"application/json", "application/xml"}):
-        return True
-    if path.suffix.lower() in {glob[1:] for glob in DEFAULT_INCLUDE_GLOBS if glob.startswith("*")}:
-        return True
-    try:
-        sample = path.read_bytes()[:2048]
-    except OSError:
-        return False
-    return b"\x00" not in sample
-
-
-def looks_like_file_token(token: str) -> bool:
-    if not token or token.startswith(("http://", "https://", "mailto:")):
-        return False
-    if any(ch in token for ch in ("/", "\\")):
-        return True
-    suffix = Path(token).suffix.lower()
-    known_suffixes = {glob[1:] for glob in DEFAULT_INCLUDE_GLOBS if glob.startswith("*")}
-    known_suffixes.update({".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf", ".docx", ".xlsx"})
-    return suffix in known_suffixes
-
-
-def strip_line_noise(token: str) -> str:
-    token = token.strip().strip("`'\"")
-    token = token.rstrip(".,;:)")
-    token = token.lstrip("(")
-    if token.startswith("./") or token.startswith(".\\"):
-        token = token[2:]
-    return token
-
-
-def extract_frontmatter_files(content: str) -> list[str]:
-    match = re.match(r"\A---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
-    if not match:
-        return []
-
-    files: list[str] = []
-    lines = match.group(1).splitlines()
-    in_files = False
-    for line in lines:
-        stripped = line.strip()
-        if re.match(r"^(files|file_refs|references)\s*:\s*$", stripped, re.I):
-            in_files = True
-            continue
-        if in_files and re.match(r"^[A-Za-z_][\w-]*\s*:", stripped) and not stripped.startswith("-"):
-            in_files = False
-        if in_files and stripped.startswith("-"):
-            files.append(strip_line_noise(stripped[1:].strip()))
-        else:
-            inline = re.match(r"^(file|path)\s*:\s*(.+)$", stripped, re.I)
-            if inline:
-                files.append(strip_line_noise(inline.group(2)))
-    return files
-
-
-def extract_file_references(content: str, base_dir: Path) -> list[FileReference]:
-    candidates: list[str] = []
-    candidates.extend(extract_frontmatter_files(content))
-
-    for match in re.finditer(r"`([^`\n]+)`", content):
-        token = strip_line_noise(match.group(1))
-        if looks_like_file_token(token):
-            candidates.append(token)
-
-    for match in re.finditer(r"\[[^\]\n]+\]\(([^)\n]+)\)", content):
-        token = strip_line_noise(match.group(1).split("#", 1)[0])
-        if looks_like_file_token(token):
-            candidates.append(token)
-
+def parse_a_file(a_path: Path):
+    content = a_path.read_text(encoding="utf-8")
+    sections = {}
+    current = None
     for line in content.splitlines():
-        stripped = line.strip()
-        list_match = re.match(r"^(?:[-*]|\d+[.)])\s+(?:file|files|path|ref|reference)s?\s*:\s*(.+)$", stripped, re.I)
-        if list_match:
-            candidates.append(strip_line_noise(list_match.group(1)))
+        m = re.match(r'<<<(.+?)>>>', line.strip())
+        if m:
+            current = m.group(1).strip()
+            sections[current] = []
+        elif current:
+            sections[current].append(line)
+    return {k: '\n'.join(v).strip() for k, v in sections.items() if v}, content
 
-    seen: set[str] = set()
-    refs: list[FileReference] = []
-    for raw in candidates:
-        if not raw or raw in seen:
-            continue
-        seen.add(raw)
-        candidate = Path(raw).expanduser()
-        resolved = candidate if candidate.is_absolute() else (base_dir / candidate)
-        resolved = resolved.resolve()
-        if not resolved.exists():
-            refs.append(FileReference(raw=raw, resolved=resolved, exists=False, reason="not found"))
-            continue
-        if resolved.is_dir():
-            refs.append(FileReference(raw=raw, resolved=resolved, exists=True, reason="directory"))
-            continue
 
-        size = resolved.stat().st_size
-        inline = size <= MAX_INLINE_CHARS and is_probably_text(resolved)
-        reason = "included inline" if inline else ("too large" if size > MAX_INLINE_CHARS else "binary or unknown text")
-        content_text = ""
-        if inline:
-            try:
-                content_text = read_text(resolved)
-            except UnicodeDecodeError:
-                inline = False
-                reason = "not utf-8 text"
-        refs.append(
-            FileReference(
-                raw=raw,
-                resolved=resolved,
-                exists=True,
-                size=size,
-                inline=inline,
-                reason=reason,
-                content=content_text,
-            )
-        )
+def parse_code_refs(code_section: str):
+    """Yield (label, repo_path) pairs from the <<<Code>>> section lines."""
+    refs = []
+    for line in code_section.splitlines():
+        if ':' not in line:
+            continue
+        label, repo = line.split(':', 1)
+        label = label.strip().strip('-* ')
+        repo = repo.strip().strip('-* ')
+        if repo:
+            refs.append((label or repo, repo))
     return refs
 
 
-def language_for(path: Path) -> str:
-    suffix = path.suffix.lower().lstrip(".")
-    return {
-        "csproj": "xml",
-        "props": "xml",
-        "targets": "xml",
-        "ps1": "powershell",
-        "py": "python",
-        "js": "javascript",
-        "jsx": "jsx",
-        "ts": "typescript",
-        "tsx": "tsx",
-        "yml": "yaml",
-        "yaml": "yaml",
-        "md": "markdown",
-    }.get(suffix, suffix or "text")
+def zip_repo(repo_path: str, zip_name: str):
+    path = Path(repo_path).resolve()
+    if not path.exists() or not path.is_dir():
+        print(f"⚠️  Repo path {repo_path} not found or not a directory")
+        return False
+    zip_path = Path(zip_name)
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
+        for root, dirs, files in os.walk(path):
+            dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+            for file in files:
+                if file in EXCLUDE_FILES:
+                    continue
+                full = Path(root) / file
+                arc = full.relative_to(path.parent) if full.is_relative_to(path.parent) else full.name
+                z.write(full, arc)
+    print(f"✅ Zipped {path} → {zip_path}")
+    return True
 
 
-def compile_prompt(a_path: Path) -> tuple[str, list[FileReference]]:
-    a_content = read_text(a_path)
-    refs = extract_file_references(a_content, a_path.parent)
+def produce_b(a_path: Path):
+    sections, full_a = parse_a_file(a_path)
+    code_section = sections.get("Code", "")
+    refs = parse_code_refs(code_section)
 
-    lines: list[str] = []
-    lines.append("# Agent Loop Packet")
-    lines.append("")
-    lines.append(f"Generated: {datetime.now().isoformat(timespec='seconds')}")
-    lines.append(f"Source A: `{a_path}`")
-    lines.append("")
-    lines.append("## Your Task")
-    lines.append("")
-    lines.append(
-        "You are an external agent in an iterative prompt-improvement loop. "
-        "Answer the user's current request, and also return a revised next prompt document "
-        "that can be reviewed by a human and used for the next iteration."
-    )
-    lines.append("")
-    lines.append("## Required Response Format")
-    lines.append("")
-    lines.append("Return exactly one structured response using these markers:")
-    lines.append("")
-    lines.append(BEGIN_MARKER)
-    lines.append(f"{NOTES_BEGIN}")
-    lines.append("Human-readable answer, review notes, assumptions, risks, and next-step suggestions.")
-    lines.append(f"{NOTES_END}")
-    lines.append(f"{NEXT_A_BEGIN}")
-    lines.append(
-        "A complete revised Markdown document for the next iteration. "
-        "It should preserve still-relevant content from the below Current Question section, incorporate your new findings, "
-        "and remain readable/editable by a human."
-    )
-    lines.append(f"{NEXT_A_END}")
-    lines.append(f"{DIFF_BEGIN}")
-    lines.append(
-        "Optional unified git diff only if code changes are proposed. "
-        "Leave this section empty if no code diff is needed."
-    )
-    lines.append(f"{DIFF_END}")
-    lines.append(END_MARKER)
-    lines.append("")
-    lines.append("Important constraints:")
-    lines.append("- Do not include hidden reasoning. Use concise rationale and actionable notes instead.")
-    lines.append("- If proposing code changes, make the diff suitable for `git apply`.")
-    lines.append("- The NEXT_A_MARKDOWN block must be complete; the local tool may write it verbatim as A(n+1).")
-    lines.append("- If a referenced file is listed but not included inline, ask the user for it only if it is necessary.")
-    lines.append("")
-    lines.append("## Current A")
-    lines.append("")
-    lines.append("```markdown")
-    lines.append(a_content.rstrip())
-    lines.append("```")
-    lines.append("")
+    # Zip referenced repos first so we can list them in the packet.
+    attached = []
+    for label, repo in refs:
+        if not Path(repo).exists():
+            print(f"⚠️  Repo path {repo} not found; skipping")
+            continue
+        base = re.sub(r'[^a-zA-Z0-9_.-]', '_', Path(repo).name) or "repo"
+        zip_name = f"{label}_{base}.zip"
+        if zip_repo(repo, zip_name):
+            attached.append((label, repo, zip_name))
 
-    if refs:
-        lines.append("## Referenced Files")
-        lines.append("")
-        listed = [ref for ref in refs if not ref.inline]
-        inlined = [ref for ref in refs if ref.inline]
-        if listed:
-            lines.append("### File Links / Attach Separately")
-            lines.append("")
-            for ref in listed:
-                status = ref.reason if ref.exists else "not found locally"
-                size = f", {ref.size} bytes" if ref.exists and ref.size else ""
-                lines.append(f"- `{ref.raw}` -> `{ref.resolved}` ({status}{size})")
-            lines.append("")
-        if inlined:
-            lines.append("### Inline File Contents")
-            lines.append("")
-            for ref in inlined:
-                lines.append(f"#### `{ref.raw}`")
-                lines.append("")
-                lines.append(f"```{language_for(ref.resolved)}")
-                lines.append(ref.content.rstrip())
-                lines.append("```")
-                lines.append("")
+    b_content = f"""# AGENT LOOP B PACKET for {a_path.name}
+Generated: {datetime.now().isoformat()}
 
-    lines.append("Now produce the structured response.")
-    return "\n".join(lines).rstrip() + "\n", refs
+<<<INSTRUCTIONS>>>
+You are participating in an iterative agentic problem-solving loop.
+The user will feed your response back into a local tool, so format matters.
+
+Respond **exactly** in this format (do not add extra sections):
+
+<<<Agent Answer>>>
+Concise, high-value contribution. Focus on new insights, decisions, or changes
+that can be merged into the original state with minimal redundancy. Take into
+account any prior <<<Agent Answer n>>> and <<<Feedback n>>> already in CURRENT A.
+
+<<<Code diff>>>
+Unified git diffs (`git diff -U3` style) that can be applied with `git apply`
+from the root of the relevant repo. Use one diff block per file when possible.
+If no code changes, write "No code changes this turn."
+"""
+
+    if attached:
+        b_content += "\n<<<ATTACHED REPOS>>>\n"
+        b_content += ("The referenced repositories are attached to this message as zip files "
+                      "(directories like .git/node_modules are excluded). Unzip and inspect "
+                      "them as needed; diffs should apply from each repo's root.\n")
+        for label, repo, zip_name in attached:
+            b_content += f"- {label}: {zip_name}  (from {repo})\n"
+
+    b_content += "\n<<<CURRENT A>>>\n" + full_a + "\n"
+
+    b_path = a_path.with_suffix('.B.md')
+    b_path.write_text(b_content, encoding="utf-8")
+    print(f"✅ Wrote {b_path}")
+    if copy_to_clipboard(b_content):
+        print("📋 Copied B packet to clipboard")
+    if attached:
+        print("Attach these zips to your message: " + ", ".join(z for _, _, z in attached))
 
 
-def copy_to_clipboard(text: str) -> bool:
-    if CLIPBOARD_AVAILABLE:
-        try:
-            pyperclip.copy(text)
-            return True
-        except Exception:
-            pass
-
-    if sys.platform.startswith("win"):
-        try:
-            subprocess.run(
-                ["powershell", "-NoProfile", "-Command", "Set-Clipboard -Value ([Console]::In.ReadToEnd())"],
-                input=text,
-                text=True,
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            return True
-        except Exception:
-            return False
-    return False
-
-
-def next_a_path(a_path: Path, explicit: str | None = None) -> Path:
-    if explicit:
-        return Path(explicit)
-
-    match = re.search(r"(\d+)$", a_path.stem)
-    if match:
-        number = int(match.group(1))
-        stem = f"{a_path.stem[:match.start(1)]}{number + 1}"
-    else:
-        stem = f"{a_path.stem}_next"
-    return a_path.with_name(stem + a_path.suffix)
-
-
-def sidecar_path(a_path: Path, label: str, suffix: str) -> Path:
-    return a_path.with_name(f"{a_path.stem}.{label}{suffix}")
-
-
-def extract_between(text: str, begin: str, end: str) -> str:
-    pattern = re.escape(begin) + r"\s*(.*?)\s*" + re.escape(end)
-    match = re.search(pattern, text, re.DOTALL)
-    return match.group(1).strip() if match else ""
+def extract_section(text: str, name: str) -> str:
+    m = re.search(rf'<<<{name}>>>(.*?)(?=<<<|$)', text, re.DOTALL | re.IGNORECASE)
+    return (m.group(1).strip() if m else f"(No {name} section found)").strip()
 
 
 def strip_outer_fence(text: str) -> str:
     text = text.strip()
-    match = re.match(r"^```[A-Za-z0-9_-]*\s*\n(.*?)\n```$", text, re.DOTALL)
-    return match.group(1).strip() if match else text
+    m = re.match(r'^```[A-Za-z0-9_-]*\s*\n(.*?)\n```$', text, re.DOTALL)
+    return m.group(1).strip() if m else text
 
 
-def build_fallback_next_a(a_path: Path, c_text: str) -> str:
-    original = read_text(a_path).rstrip()
-    notes = extract_between(c_text, NOTES_BEGIN, NOTES_END)
-    if not notes:
-        notes = c_text.strip()
-
-    return "\n\n".join(
-        [
-            original,
-            "---",
-            f"## Agent Loop Update ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})",
-            strip_outer_fence(notes),
-            (
-                "Note: The external agent did not provide a valid "
-                f"{NEXT_A_BEGIN} / {NEXT_A_END} block, so this update was appended instead."
-            ),
-        ]
-    )
+def next_round_index(a_content: str) -> int:
+    """Next round number = highest existing <<<Agent Answer n>>> + 1."""
+    nums = [int(n) for n in re.findall(r'<<<Agent Answer (\d+)>>>', a_content, re.IGNORECASE)]
+    return (max(nums) + 1) if nums else 1
 
 
-def integrate_response(a_path: Path, c_path: Path, output_path: Path | None = None) -> tuple[Path, Path | None]:
-    c_text = read_text(c_path)
-    next_a = extract_between(c_text, NEXT_A_BEGIN, NEXT_A_END)
-    if next_a:
-        next_a = strip_outer_fence(next_a)
-    else:
-        next_a = build_fallback_next_a(a_path, c_text)
-
-    out_path = output_path or next_a_path(a_path)
-    write_text(out_path, next_a)
-
-    diff_text = extract_between(c_text, DIFF_BEGIN, DIFF_END)
-    diff_path = None
-    if diff_text.strip():
-        diff_path = sidecar_path(out_path, "diff", ".patch")
-        write_text(diff_path, strip_outer_fence(diff_text))
-
-    notes = extract_between(c_text, NOTES_BEGIN, NOTES_END)
-    if notes.strip():
-        notes_path = sidecar_path(out_path, "notes", ".md")
-        write_text(notes_path, strip_outer_fence(notes))
-
-    return out_path, diff_path
+def next_a_path(a_path: Path, out_number: int) -> Path:
+    """Strip any trailing round marker on the stem and re-apply the new one."""
+    base = re.sub(r'[._]A\d+$', '', a_path.stem)
+    # also drop a bare trailing ".A" left by the template naming (some.A.md)
+    base = re.sub(r'\.A$', '', base)
+    return a_path.with_name(f"{base}.A{out_number}.md")
 
 
-def write_refs_file(a_path: Path, refs: Iterable[FileReference]) -> Path | None:
-    refs = list(refs)
-    attachable = [ref for ref in refs if not ref.inline]
-    if not attachable:
-        return None
+def produce_a2(a_path: Path, c_path: Path):
+    a_content = a_path.read_text(encoding="utf-8")
+    c_content = c_path.read_text(encoding="utf-8")
 
-    path = sidecar_path(a_path, "files", ".txt")
-    lines = []
-    for ref in attachable:
-        lines.append(str(ref.resolved))
-    write_text(path, "\n".join(lines))
-    return path
+    agent_answer = extract_section(c_content, "Agent Answer")
+    code_diff = strip_outer_fence(extract_section(c_content, "Code diff"))
+
+    idx = next_round_index(a_content)
+
+    a2 = a_content.rstrip()
+    a2 += f"\n\n<<<Agent Answer {idx}>>>\n{agent_answer}\n"
+    a2 += f"\n<<<Code diff {idx}>>>\n{code_diff}\n"
+    a2 += (f"\n<<<Feedback {idx}>>>\n"
+           f"(Add your feedback / next instructions here, then run the next round.)\n")
+
+    a2_path = next_a_path(a_path, idx + 1)
+    a2_path.write_text(a2, encoding="utf-8")
+    print(f"✅ Wrote draft round {idx + 1}: {a2_path}")
+
+    # Sidecar patch for easy `git apply`, when there is a real diff.
+    if code_diff and not re.match(r'^\s*no code changes', code_diff, re.IGNORECASE):
+        patch_path = a2_path.with_name(f"{a2_path.stem}.diff{idx}.patch")
+        patch_path.write_text(code_diff.rstrip() + "\n", encoding="utf-8")
+        print(f"✅ Wrote patch: {patch_path}  (apply with: git apply {patch_path.name})")
+
+    print(f"Review, fill in <<<Feedback {idx}>>>, then run: "
+          f"python agent_loop.py {a2_path.name} <next C>.md")
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Compile an A(n) Markdown prompt into B(n), or integrate C(n) into A(n+1)."
-    )
-    parser.add_argument("a_file", help="A(n) Markdown prompt file")
-    parser.add_argument("c_file", nargs="?", help="C(n) response file from the external agent")
-    parser.add_argument("-o", "--output", help="Output file for B(n) or A(n+1)")
-    parser.add_argument("--no-clipboard", action="store_true", help="Do not copy B(n) to the clipboard")
-    return parser
-
-
-def main() -> int:
-    args = build_parser().parse_args()
-    a_path = Path(args.a_file).resolve()
-    if not a_path.exists():
-        print(f"ERROR: A file does not exist: {a_path}", file=sys.stderr)
-        return 1
-
-    if args.c_file:
-        c_path = Path(args.c_file).resolve()
-        if not c_path.exists():
-            print(f"ERROR: C file does not exist: {c_path}", file=sys.stderr)
-            return 1
-        output_path = Path(args.output).resolve() if args.output else None
-        out_path, diff_path = integrate_response(a_path, c_path, output_path)
-        print(f"Wrote next A: {out_path}")
-        if diff_path:
-            print(f"Wrote proposed git diff: {diff_path}")
-        return 0
-
-    packet, refs = compile_prompt(a_path)
-    output_path = Path(args.output).resolve() if args.output else sidecar_path(a_path, "B", ".md")
-    write_text(output_path, packet)
-    refs_path = write_refs_file(a_path, refs)
-
-    copied = False if args.no_clipboard else copy_to_clipboard(packet)
-    print(packet)
-    print(f"\nWrote B packet: {output_path}", file=sys.stderr)
-    if copied:
-        print("Copied B packet to clipboard", file=sys.stderr)
-    elif not args.no_clipboard:
-        print("Clipboard copy unavailable; use stdout or the B packet file", file=sys.stderr)
-    if refs_path:
-        print(f"Wrote separate file list: {refs_path}", file=sys.stderr)
-    return 0
+def copy_to_clipboard(text: str) -> bool:
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Set-Clipboard -Value ([Console]::In.ReadToEnd())"],
+            input=text, text=True, check=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return True
+    except Exception:
+        return False
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--template", type=Path, help="Generate initial A template")
+    parser.add_argument("a_file", type=Path, nargs="?", help="A.md file")
+    parser.add_argument("c_file", type=Path, nargs="?", help="Optional C.md to generate next A")
+    args = parser.parse_args()
+
+    if args.template:
+        generate_template(args.template)
+    elif args.a_file and not args.c_file:
+        produce_b(args.a_file)
+    elif args.a_file and args.c_file:
+        produce_a2(args.a_file, args.c_file)
+    else:
+        parser.print_help()
