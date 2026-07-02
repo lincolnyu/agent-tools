@@ -26,6 +26,7 @@ kept for undo.
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
 import zipfile
@@ -49,8 +50,8 @@ Be specific about goals, constraints, and what success looks like.
 Reference code repos using code1, code2, etc.
 
 <<<Code>>>
-- code1: path/to/first/repo
-- code2: path/to/second/repo (if needed)
+- code1: path/to/a/repo
+- somefile: path/to/a/file
 """
     output_path.write_text(template, encoding="utf-8")
     print(f"✅ Template generated: {output_path}")
@@ -125,6 +126,23 @@ def zip_repo(repo_path: str, zip_name: str):
     return True
 
 
+def link_file(src: Path, dest: Path) -> bool:
+    """Symlink src into the outbox as dest. Falls back to a copy where symlinks
+    aren't permitted (e.g. Windows without Developer Mode / admin)."""
+    try:
+        dest.symlink_to(src.resolve())
+        print(f"🔗 Linked {src} → {dest}")
+        return True
+    except OSError as e:
+        try:
+            shutil.copy2(src, dest)
+            print(f"✅ Copied {src} → {dest}  (symlink unavailable: {e.strerror or e})")
+            return True
+        except OSError as e2:
+            print(f"⚠️  Could not link or copy {src}: {e2}")
+            return False
+
+
 def copy_to_clipboard(text: str) -> bool:
     if not sys.platform.startswith("win"):
         return False
@@ -149,15 +167,27 @@ def produce_out(a_path: Path):
     files_dir = a_path.with_name(a_path.stem + "-files")
     files_dir.mkdir(exist_ok=True)
 
-    repo_zips = {}  # zip filename -> source repo path
-    for label, repo in refs:
-        if not Path(repo).exists():
-            print(f"⚠️  Repo path {repo} not found; skipping")
+    sources = {}  # attached filename -> human description
+    for label, ref in refs:
+        src = Path(ref)
+        if not src.exists():
+            print(f"⚠️  Path {ref} not found; skipping")
             continue
-        base = re.sub(r'[^a-zA-Z0-9_.-]', '_', Path(repo).name) or "repo"
-        zip_name = f"{label}_{base}.zip"
-        if zip_repo(repo, str(files_dir / zip_name)):
-            repo_zips[zip_name] = repo
+        if src.is_dir():
+            # A directory is a repo: zip it fresh (refreshes any prior zip).
+            base = re.sub(r'[^a-zA-Z0-9_.-]', '_', src.name) or "repo"
+            zip_name = f"{label}_{base}.zip"
+            if zip_repo(ref, str(files_dir / zip_name)):
+                sources[zip_name] = f"repo: {ref}"
+        else:
+            # A file is symlinked flat into the outbox by its basename.
+            dest = files_dir / src.name
+            if os.path.lexists(dest):
+                print(f"↪️  {src.name} already in {files_dir.name}/, leaving as-is")
+                sources.setdefault(src.name, f"file: {ref}")
+                continue
+            if link_file(src, dest):
+                sources[src.name] = f"file: {ref}"
 
     attached = sorted(p.name for p in files_dir.iterdir() if p.is_file())
 
@@ -188,8 +218,8 @@ no code changes, write "No code changes this turn."
                 f".gitignore respected; unzip and inspect as needed, and apply diffs "
                 f"from each repo's root.\n")
         for name in attached:
-            if name in repo_zips:
-                out += f"- {name}  (repo: {repo_zips[name]})\n"
+            if name in sources:
+                out += f"- {name}  ({sources[name]})\n"
             else:
                 out += f"- {name}\n"
 

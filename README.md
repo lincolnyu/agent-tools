@@ -60,13 +60,19 @@ Be specific about goals, constraints, and what success looks like.
 Reference code repos using code1, code2, etc.
 
 <<<Code>>>
-- code1: path/to/first/repo
-- code2: path/to/second/repo (if needed)
+- code1: path/to/a/repo
+- somefile: path/to/a/file
 ```
 
 - **`<<<Original State>>>`** — your task/question, goals and constraints.
 - **`<<<Code>>>`** — one `label: path` per line, each pointing at a local repo
-  to package. The `label` names the zip (`code1_<reponame>.zip`).
+  **or** file to attach:
+  - a **directory** is packaged as a zip named `<label>_<dirname>.zip`;
+  - a **file** is symlinked flat into the outbox by its basename (falling back
+    to a copy where symlinks aren't permitted). If a file of that name is
+    already in the folder, it's left as-is.
+
+  The list is flat — no subfolders are created in the outbox.
 
 As rounds progress, the tool appends `<<<Agent Answer>>>` and a blank
 `<<<Feedback>>>` stub for each round, growing the document into a full thread.
@@ -92,7 +98,8 @@ any manual files in the doc where it matters; the tool just lists them so nothin
 is silently attached. `topic.out.md` itself stays at top level — it's the text you
 paste, the folder is what you attach.
 
-Each referenced repo is zipped into `topic-files/`:
+Directory entries in `<<<Code>>>` are zipped into `topic-files/` (file entries
+are symlinked, as described above):
 
 - If the path is a **git repo**, the zip contains exactly what git does *not*
   ignore — tracked **and** untracked files, honoring every `.gitignore` layer,
