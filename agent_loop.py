@@ -22,12 +22,15 @@ document, the "A" document, and shuttle information through the chat by hand:
      sometopic.diff.md, review it, apply its code changes to your repos by hand.
 
   4. python agent_loop.py sometopic.md sometopic.diff.md
-     Append the agent's answer to sometopic.md as `<<<Agent Answer <timestamp>>>>`,
+     Append the agent's answer to sometopic.md as `<<<Agent Answer <timestamp>>>>`
+     plus an empty `<<<User Response <timestamp>>>>` stub for your feedback,
      backing up the previous version as sometopic.<timestamp>.md, then loop.
 
-sometopic.md is the single evolving narrative (problem + accumulated answers).
-Code never lives in it. sometopic.out.md and sometopic.diff.md are transient
-and overwritten each round.
+sometopic.md is the single evolving narrative: the problem, then each agent
+answer paired with your response to it. Both flow into the next B document so
+the agent sees the running dialogue. Relative paths under <<<Files>>> are
+resolved against the A document's own directory. Code never lives in the A
+document. sometopic.out.md and sometopic.diff.md are transient.
 """
 
 import argparse
@@ -52,11 +55,13 @@ EXCLUDE_FILES = {'.DS_Store'}
 INSTRUCTIONS = (
     "You are an agent in an iterative, human-in-the-loop problem-solving loop. "
     "A human will paste your reply back into a local tool, so **format matters**. "
-    "Read the problem, the prior answers, and the attached files below, then reply "
-    "in EXACTLY the format given under \"Required Response Format\" at the END of "
-    "this document — those two sections and nothing else. Be concise and additive: "
-    "the prior answers are already recorded, so contribute what is new rather than "
-    "restating them."
+    "Read the problem, the history, and the attached files below, then reply in "
+    "EXACTLY the format given under \"Required Response Format\" at the END of this "
+    "document — those two sections and nothing else. The history interleaves your "
+    "predecessors' answers (`<<<Agent Answer T>>>`) with the human's feedback on "
+    "them (`<<<User Response T>>>`, matching timestamps); treat the user responses "
+    "as authoritative guidance. Be concise and additive: the history is already "
+    "recorded, so contribute what is new rather than restating it."
 )
 
 RESPONSE_FORMAT = """Reply with these two sections only, using these exact markers:
@@ -104,10 +109,16 @@ def extract_section(text: str, name: str) -> str:
     return m.group(1).strip() if m else ""
 
 
-def extract_agent_answers(a_content: str) -> str:
-    """All accumulated `<<<Agent Answer <ts>>>>` blocks, from the first one to EOF."""
+def extract_history(a_content: str) -> str:
+    """The accumulated `<<<Agent Answer <ts>>>>` / `<<<User Response <ts>>>>`
+    blocks, from the first agent answer to EOF, with empty user-response stubs
+    dropped so unanswered rounds add no noise."""
     m = re.search(r'(?im)^<<<\s*Agent Answer\b', a_content)
-    return a_content[m.start():].strip() if m else ""
+    if not m:
+        return ""
+    region = a_content[m.start():].strip()
+    region = re.sub(r'(?is)<<<\s*User Response[^>]*>>>\s*(?=<<<|\Z)', '', region)
+    return region.strip()
 
 
 def parse_file_refs(files_section: str):
@@ -192,19 +203,23 @@ def produce_out(a_path: Path):
     a_content = a_path.read_text(encoding="utf-8")
     problem = extract_section(a_content, "Problem")
     files_section = extract_section(a_content, "Files")
-    answers = extract_agent_answers(a_content)
+    history = extract_history(a_content)
     refs = parse_file_refs(files_section)
 
-    # Rebuild the outbox from scratch so it mirrors the current # Files list.
+    # Rebuild the outbox from scratch so it mirrors the current <<<Files>>> list.
     files_dir = a_path.with_name(a_path.stem + "-files")
     if files_dir.exists():
         shutil.rmtree(files_dir)
     files_dir.mkdir()
 
+    # Relative reference paths are resolved against the A document's directory.
+    base_dir = a_path.resolve().parent
     used = set()          # attached basenames, to detect collisions
     ref_rows = []         # (refname, path, attached-name) — successful attachments only
     for label, ref_str in refs:
         src = Path(ref_str).expanduser()
+        if not src.is_absolute():
+            src = base_dir / src
         if not src.exists():
             print(f"↪️  {label}: {ref_str} — not found, ignoring")
             continue
@@ -239,8 +254,8 @@ def produce_out(a_path: Path):
         "## Problem",
         problem or "(no problem section)",
         "",
-        "## Prior Agent Answers",
-        answers or "(none yet)",
+        "## History (prior answers and user feedback)",
+        history or "(none yet)",
         "",
         "## File References",
         refs_block,
@@ -277,12 +292,14 @@ def integrate(a_path: Path, diff_path: Path):
         backup_path = a_path.with_suffix(f'.{ts}.md')
     backup_path.write_text(a_content, encoding="utf-8")
 
-    merged = a_content.rstrip() + f"\n\n<<<Agent Answer {ts}>>>\n\n{answer}\n"
+    merged = (a_content.rstrip()
+              + f"\n\n<<<Agent Answer {ts}>>>\n\n{answer}\n"
+              + f"\n<<<User Response {ts}>>>\n\n")
     a_path.write_text(merged, encoding="utf-8")
 
     print(f"✅ Appended '<<<Agent Answer {ts}>>>' to {a_path.name}  (backup: {backup_path.name})")
-    print(f"   Apply the reply's <<<Code diff>>> to your code by hand if needed, then run: "
-          f"python agent_loop.py {a_path.name}")
+    print(f"   Add feedback under '<<<User Response {ts}>>>' if any, apply the reply's "
+          f"<<<Code diff>>> by hand if needed, then run: python agent_loop.py {a_path.name}")
 
 
 if __name__ == "__main__":

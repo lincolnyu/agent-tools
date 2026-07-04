@@ -73,14 +73,18 @@ Refer to inputs by their reference name (defined under <<<Files>>>).
 - **`<<<Problem>>>`** — your task/question, goals, constraints. Refer to inputs by
   their reference name so the agent can connect prose to attachments.
 - **`<<<Files>>>`** — one `refname: path` per line, each pointing at a local
-  **file** or **folder**. The list is flat; reference names (and the resulting
-  attachment names) must be distinct. An entry whose path doesn't exist (a broken
-  link, or a deliberate `refname: n/a`) is simply ignored — not attached and not
-  listed in the B document.
+  **file** or **folder**. Relative paths are resolved against the **A document's
+  own directory** (not the cwd). The list is flat; reference names (and the
+  resulting attachment names) must be distinct. An entry whose path doesn't exist
+  (a broken link, or a deliberate `refname: n/a`) is simply ignored — not attached
+  and not listed in the B document.
 
-As rounds progress, the tool appends a `<<<Agent Answer <timestamp>>>>` section
-for each round, growing the document into a full thread. You own this file and
-can edit any part of it between rounds.
+As rounds progress, the tool appends, for each round, an
+`<<<Agent Answer <timestamp>>>>` section followed by an empty
+`<<<User Response <timestamp>>>>` stub (matching timestamps). Fill the stub with
+your feedback on that answer, or leave it empty. Both accumulate into the growing
+document — your running dialogue with the agent — and you can edit any part of it
+between rounds.
 
 ## Step 2 — building the B document (`sometopic.out.md`)
 
@@ -89,7 +93,9 @@ prompt you paste into the chat, laid out in reading order:
 
 1. **Instructions** — how to respond, pointing at the format at the very end.
 2. **Problem** — from `<<<Problem>>>`.
-3. **Prior Agent Answers** — every accumulated answer so far (empty on round 1).
+3. **History** — every accumulated `<<<Agent Answer T>>>` interleaved with your
+   `<<<User Response T>>>` feedback (matching timestamps); empty responses are
+   dropped. Empty on round 1.
 4. **File References** — each `refname: path → attached-name`, plus the list of
    attachments (ignored/missing refs don't appear).
 5. **Required Response Format** — placed last so it's the final, unambiguous
@@ -130,7 +136,8 @@ You may edit the reply before folding it in, but usually won't.
 2. Backs up the current `sometopic.md` to `sometopic.<timestamp>.md` (timestamp
    `YYYYMMDDHHMM`, e.g. `202607041940` = 2026-07-04 19:40; extends to seconds only
    if a same-minute backup already exists, so nothing is clobbered).
-3. Appends the answer as a new `<<<Agent Answer <timestamp>>>>` section.
+3. Appends the answer as a new `<<<Agent Answer <timestamp>>>>` section, followed
+   by an empty `<<<User Response <timestamp>>>>` stub for your feedback.
 
 The code diff is not touched — apply it to your repos yourself, then loop.
 
