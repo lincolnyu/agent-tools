@@ -3,24 +3,31 @@
 agent_loop.py - a manual, human-in-the-loop "agent loop".
 
 A file-shuttling helper for iterating with an external LLM chat agent you
-cannot script (a web UI like Grok/ChatGPT). Instead of an API you pass one
-Markdown document back and forth, in place:
+cannot script (a web UI like Grok/ChatGPT/Claude). You keep one Markdown
+document, the "A" document, and shuttle information through the chat by hand:
 
-  1. python agent_loop.py --template topic.md   # scaffold the working doc
-     -> edit topic.md: <<<Original State>>> (task) + <<<Code>>> (repo refs)
-  2. python agent_loop.py topic.md              # -> topic.out.md (+ repo zips)
-     -> paste topic.out.md into the chat, attach the zips, save the reply as
-        topic.diff.md
-  3. python agent_loop.py topic.md topic.diff.md # fold the reply into topic.md
-     -> the agent's answer + a feedback stub are appended to topic.md; any
-        proposed code diff is written to topic.patch for you to review and
-        apply to the repo BY HAND (agent patches are not trusted/auto-applied)
-     -> apply the changes, revise topic.md, then go back to step 2
+  1. python agent_loop.py --new [sometopic.md]
+     Scaffold a fresh A document (defaults to <cwd-name>.md). Fill in its
+     `<<<Problem>>>` section and list inputs under `<<<Files>>>` as
+     `- refname: path/to/file/or/folder`.
 
-topic.md is the single evolving narrative (task -> answers -> feedback); code
-never lives in it. The repo is the source of truth and is re-zipped fresh every
-round, so whatever you apply is carried forward. A one-deep topic.bak.md is
-kept for undo.
+  2. python agent_loop.py sometopic.md
+     Build the "B" document sometopic.out.md (instructions + problem + prior
+     answers + file references + the required response format) and a
+     sometopic-files/ folder: referenced files are symlinked in (copied if
+     symlinks aren't permitted), referenced folders are zipped in. Paste the
+     .out.md into the chat and attach everything in sometopic-files/.
+
+  3. Save the agent's reply (must use <<<Agent Answer>>> / <<<Code diff>>>) as
+     sometopic.diff.md, review it, apply its code changes to your repos by hand.
+
+  4. python agent_loop.py sometopic.md sometopic.diff.md
+     Append the agent's answer to sometopic.md as `<<<Agent Answer <timestamp>>>>`,
+     backing up the previous version as sometopic.<timestamp>.md, then loop.
+
+sometopic.md is the single evolving narrative (problem + accumulated answers).
+Code never lives in it. sometopic.out.md and sometopic.diff.md are transient
+and overwritten each round.
 """
 
 import argparse
@@ -42,52 +49,85 @@ except (AttributeError, ValueError):
 EXCLUDE_DIRS = {'.git', 'node_modules', '__pycache__', 'venv', 'env', 'dist', 'build', '.venv'}
 EXCLUDE_FILES = {'.DS_Store'}
 
+INSTRUCTIONS = (
+    "You are an agent in an iterative, human-in-the-loop problem-solving loop. "
+    "A human will paste your reply back into a local tool, so **format matters**. "
+    "Read the problem, the prior answers, and the attached files below, then reply "
+    "in EXACTLY the format given under \"Required Response Format\" at the END of "
+    "this document — those two sections and nothing else. Be concise and additive: "
+    "the prior answers are already recorded, so contribute what is new rather than "
+    "restating them."
+)
 
-def generate_template(output_path: Path):
-    template = """<<<Original State>>>
-Describe your question / task here in detail.
+RESPONSE_FORMAT = """Reply with these two sections only, using these exact markers:
+
+<<<Agent Answer>>>
+A clear, concise, self-contained contribution — the key insight, decision, or
+change from this round. It is appended verbatim to the working document, so
+write it as a direct addition (no need to restate prior answers).
+
+<<<Code diff>>>
+A unified git diff (`git diff -U3` style) for any code changes, one block per
+file, applyable with `git apply` from the repo root. If there are none, write:
+No code changes this turn."""
+
+
+def timestamp() -> str:
+    """Compact YYYYMMDDHHMM, e.g. 202607041940 -> 2026-07-04 19:40."""
+    return datetime.now().strftime("%Y%m%d%H%M")
+
+
+def generate_new_template(output_path: Path):
+    if output_path.exists():
+        print(f"⚠️  {output_path} already exists; not overwriting.")
+        return
+    template = """<<<Problem>>>
+
+Describe the problem / task in detail here.
 Be specific about goals, constraints, and what success looks like.
-Reference code repos using code1, code2, etc.
+Refer to inputs by their reference name (defined under <<<Files>>>).
 
-<<<Code>>>
-- code1: path/to/a/repo
-- somefile: path/to/a/file
+<<<Files>>>
+
+- ref1: path/to/a/file
+- ref2: path/to/a/folder
 """
     output_path.write_text(template, encoding="utf-8")
-    print(f"✅ Template generated: {output_path}")
-    print(f"Edit it, then run: python agent_loop.py {output_path}")
+    print(f"✅ New A document: {output_path}")
+    print(f"   Fill in <<<Problem>>> and <<<Files>>>, then run: python agent_loop.py {output_path}")
 
 
 def extract_section(text: str, name: str) -> str:
-    m = re.search(rf'<<<{name}>>>(.*?)(?=<<<|$)', text, re.DOTALL | re.IGNORECASE)
+    """Content of a `<<<name>>>` section, up to the next `<<<...>>>` marker or EOF.
+    Tolerates optional spaces inside the markers (<<< name >>>)."""
+    m = re.search(rf'<<<\s*{re.escape(name)}\s*>>>\s*(.*?)(?=\n<<<|\Z)', text, re.DOTALL | re.IGNORECASE)
     return m.group(1).strip() if m else ""
 
 
-def strip_outer_fence(text: str) -> str:
-    text = text.strip()
-    m = re.match(r'^```[A-Za-z0-9_-]*\s*\n(.*?)\n```$', text, re.DOTALL)
-    return m.group(1).strip() if m else text
+def extract_agent_answers(a_content: str) -> str:
+    """All accumulated `<<<Agent Answer <ts>>>>` blocks, from the first one to EOF."""
+    m = re.search(r'(?im)^<<<\s*Agent Answer\b', a_content)
+    return a_content[m.start():].strip() if m else ""
 
 
-def parse_code_refs(code_section: str):
-    """Yield (label, repo_path) pairs from the <<<Code>>> section lines."""
+def parse_file_refs(files_section: str):
+    """Parse `- refname: path` lines into (refname, path) pairs."""
     refs = []
-    for line in code_section.splitlines():
-        if ':' not in line:
+    for line in files_section.splitlines():
+        line = re.sub(r'^[-*\s]+', '', line.strip())
+        if not line or line.startswith('#') or ':' not in line:
             continue
-        label, repo = line.split(':', 1)
-        label = label.strip().strip('-* ')
-        repo = repo.strip().strip('-* ')
-        if repo:
-            refs.append((label or repo, repo))
+        label, path_str = line.split(':', 1)
+        label, path_str = label.strip(), path_str.strip()
+        if label and path_str:
+            refs.append((label, path_str))
     return refs
 
 
 def repo_files(path: Path):
-    """Files to zip for a repo: everything git does not ignore (the .git folder
-    itself is excluded). Returns (list_of_paths, used_git). Falls back to a
-    plain walk with EXCLUDE_DIRS when the path is not a git repo (git can't
-    honor .gitignore there)."""
+    """Files to zip for a folder: everything git does not ignore (.git excluded).
+    Returns (paths, used_git); falls back to a plain walk with EXCLUDE_DIRS when
+    the path is not a git repo (git can't honor .gitignore there)."""
     try:
         out = subprocess.run(
             ["git", "-C", str(path), "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
@@ -99,44 +139,34 @@ def repo_files(path: Path):
             dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
             files += [Path(root) / n for n in names if n not in EXCLUDE_FILES]
         return files, False
-
-    files = [path / rel for rel in out.split('\0') if rel]
-    return files, True
+    return [path / rel for rel in out.split('\0') if rel], True
 
 
-def zip_repo(repo_path: str, zip_name: str):
-    path = Path(repo_path).resolve()
-    if not path.exists() or not path.is_dir():
-        print(f"⚠️  Repo path {repo_path} not found or not a directory")
-        return False
-
-    files, used_git = repo_files(path)
-    zip_path = Path(zip_name)
+def zip_folder(src: Path, zip_path: Path) -> bool:
+    files, used_git = repo_files(src)
     with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
         for full in files:
             if not full.is_file():
                 continue  # skip staged-deleted / vanished entries
-            arc = full.relative_to(path.parent) if full.is_relative_to(path.parent) else full.name
+            arc = full.relative_to(src.parent) if full.is_relative_to(src.parent) else full.name
             z.write(full, arc)
-
-    if used_git:
-        print(f"✅ Zipped {path} → {zip_path}  (git-tracked + untracked, .gitignore respected)")
-    else:
-        print(f"⚠️  {path} is not a git repo → zipped with default excludes (.gitignore NOT respected): {zip_path}")
+    note = "git-tracked + untracked, .gitignore respected" if used_git \
+        else "not a git repo, basic excludes only (.gitignore NOT respected)"
+    print(f"✅ Zipped {src} → {zip_path.name}  ({note})")
     return True
 
 
 def link_file(src: Path, dest: Path) -> bool:
-    """Symlink src into the outbox as dest. Falls back to a copy where symlinks
-    aren't permitted (e.g. Windows without Developer Mode / admin)."""
+    """Symlink src into the outbox as dest; copy where symlinks aren't permitted
+    (e.g. Windows without Developer Mode / admin)."""
     try:
         dest.symlink_to(src.resolve())
-        print(f"🔗 Linked {src} → {dest}")
+        print(f"🔗 Linked {src} → {dest.name}")
         return True
     except OSError as e:
         try:
             shutil.copy2(src, dest)
-            print(f"✅ Copied {src} → {dest}  (symlink unavailable: {e.strerror or e})")
+            print(f"✅ Copied {src} → {dest.name}  (symlink unavailable: {e.strerror or e})")
             return True
         except OSError as e2:
             print(f"⚠️  Could not link or copy {src}: {e2}")
@@ -160,70 +190,66 @@ def copy_to_clipboard(text: str) -> bool:
 
 def produce_out(a_path: Path):
     a_content = a_path.read_text(encoding="utf-8")
-    refs = parse_code_refs(extract_section(a_content, "Code"))
+    problem = extract_section(a_content, "Problem")
+    files_section = extract_section(a_content, "Files")
+    answers = extract_agent_answers(a_content)
+    refs = parse_file_refs(files_section)
 
-    # Persistent outbox: repo zips are refreshed here each round, and the user
-    # may drop extra files in too. Nothing here is ever deleted by the tool.
+    # Rebuild the outbox from scratch so it mirrors the current # Files list.
     files_dir = a_path.with_name(a_path.stem + "-files")
-    files_dir.mkdir(exist_ok=True)
+    if files_dir.exists():
+        shutil.rmtree(files_dir)
+    files_dir.mkdir()
 
-    sources = {}  # attached filename -> human description
-    for label, ref in refs:
-        src = Path(ref)
+    used = set()          # attached basenames, to detect collisions
+    ref_rows = []         # (refname, path, attached-name) — successful attachments only
+    for label, ref_str in refs:
+        src = Path(ref_str).expanduser()
         if not src.exists():
-            print(f"⚠️  Path {ref} not found; skipping")
+            print(f"↪️  {label}: {ref_str} — not found, ignoring")
             continue
-        if src.is_dir():
-            # A directory is a repo: zip it fresh (refreshes any prior zip).
-            base = re.sub(r'[^a-zA-Z0-9_.-]', '_', src.name) or "repo"
-            zip_name = f"{label}_{base}.zip"
-            if zip_repo(ref, str(files_dir / zip_name)):
-                sources[zip_name] = f"repo: {ref}"
+        safe = re.sub(r'[^a-zA-Z0-9_.-]', '_', src.name) or "item"
+        name = f"{safe}.zip" if src.is_dir() else safe
+        if name in used:
+            print(f"⚠️  Duplicate attachment name '{name}' for {ref_str}; skipping "
+                  f"(reference names must map to distinct file names)")
+            continue
+        ok = zip_folder(src, files_dir / name) if src.is_dir() else link_file(src, files_dir / name)
+        if ok:
+            used.add(name)
+            ref_rows.append((label, ref_str, name))
         else:
-            # A file is symlinked flat into the outbox by its basename.
-            dest = files_dir / src.name
-            if os.path.lexists(dest):
-                print(f"↪️  {src.name} already in {files_dir.name}/, leaving as-is")
-                sources.setdefault(src.name, f"file: {ref}")
-                continue
-            if link_file(src, dest):
-                sources[src.name] = f"file: {ref}"
+            print(f"⚠️  {label}: could not attach {ref_str}")
 
-    attached = sorted(p.name for p in files_dir.iterdir() if p.is_file())
+    if ref_rows:
+        refs_block = "\n".join(f"- {label}: {path}  →  {att}" for label, path, att in ref_rows)
+    else:
+        refs_block = "(no file references)"
+    attached = sorted(used)
+    attach_note = (f"Attached alongside this document (in `{files_dir.name}/`): "
+                   + (", ".join(attached) if attached else "none"))
 
-    out = f"""# AGENT LOOP PACKET for {a_path.name}
-Generated: {datetime.now().isoformat()}
-
-<<<INSTRUCTIONS>>>
-You are participating in an iterative agentic problem-solving loop.
-The user will feed your response back into a local tool, so format matters.
-
-Respond **exactly** in this format (do not add extra sections):
-
-<<<Agent Answer>>>
-Concise, high-value contribution: new insights, decisions, or changes to merge
-into the working document with minimal redundancy. Take into account any prior
-<<<Agent Answer>>> and <<<Feedback>>> already present in the document below.
-
-<<<Code diff>>>
-Unified git diff (`git diff -U3` style), applicable with `git apply` from the
-root of the relevant repo. One diff block per file when possible. If there are
-no code changes, write "No code changes this turn."
-"""
-
-    if attached:
-        out += "\n<<<ATTACHED FILES>>>\n"
-        out += (f"The following files are attached to this message (from the "
-                f"{files_dir.name}/ folder). Repo zips hold the working tree with "
-                f".gitignore respected; unzip and inspect as needed, and apply diffs "
-                f"from each repo's root.\n")
-        for name in attached:
-            if name in sources:
-                out += f"- {name}  ({sources[name]})\n"
-            else:
-                out += f"- {name}\n"
-
-    out += "\n--- WORKING DOCUMENT (current state) ---\n\n" + a_content.rstrip() + "\n"
+    out = "\n".join([
+        f"# AGENT LOOP PACKET — {a_path.name}",
+        f"Generated: {datetime.now().isoformat(timespec='seconds')}",
+        "",
+        "## Instructions",
+        INSTRUCTIONS,
+        "",
+        "## Problem",
+        problem or "(no problem section)",
+        "",
+        "## Prior Agent Answers",
+        answers or "(none yet)",
+        "",
+        "## File References",
+        refs_block,
+        "",
+        attach_note,
+        "",
+        "## Required Response Format",
+        RESPONSE_FORMAT,
+    ]).rstrip() + "\n"
 
     out_path = a_path.with_suffix('.out.md')
     out_path.write_text(out, encoding="utf-8")
@@ -235,55 +261,42 @@ no code changes, write "No code changes this turn."
 
 
 def integrate(a_path: Path, diff_path: Path):
+    if not diff_path.exists():
+        print(f"❌ {diff_path} not found")
+        return
     a_content = a_path.read_text(encoding="utf-8")
-    reply = diff_path.read_text(encoding="utf-8")
-
-    answer = extract_section(reply, "Agent Answer")
-    code_diff = strip_outer_fence(extract_section(reply, "Code diff"))
-    if not answer and not code_diff:
-        print(f"❌ No <<<Agent Answer>>> / <<<Code diff>>> found in {diff_path}; "
-              f"leaving files untouched.")
+    answer = extract_section(diff_path.read_text(encoding="utf-8"), "Agent Answer")
+    if not answer:
+        print(f"❌ No <<<Agent Answer>>> found in {diff_path}; leaving files untouched.")
         return
 
-    # Only the narrative thread goes into the working doc. Code lives in the
-    # repo (re-zipped fresh every round), never in A.
-    merged = a_content.rstrip()
-    merged += "\n\n<<<Agent Answer>>>\n" + (answer or "(none)") + "\n"
-    merged += "\n<<<Feedback>>>\n(Add your feedback / next instructions here, then run the next round.)\n"
+    ts = timestamp()
+    backup_path = a_path.with_suffix(f'.{ts}.md')
+    if backup_path.exists():  # rare same-minute rerun: extend precision, don't clobber
+        ts = datetime.now().strftime("%Y%m%d%H%M%S")
+        backup_path = a_path.with_suffix(f'.{ts}.md')
+    backup_path.write_text(a_content, encoding="utf-8")
 
-    # Keep one-deep undo, then overwrite the working doc in place.
-    a_path.with_suffix('.bak.md').write_text(a_content, encoding="utf-8")
+    merged = a_content.rstrip() + f"\n\n<<<Agent Answer {ts}>>>\n\n{answer}\n"
     a_path.write_text(merged, encoding="utf-8")
 
-    # The code diff is a per-round review aid only, never applied by this tool.
-    patch_path = a_path.with_suffix('.patch')
-    has_patch = bool(code_diff) and not re.match(r'^\s*no code changes', code_diff, re.IGNORECASE)
-    if has_patch:
-        patch_path.write_text(code_diff.rstrip() + "\n", encoding="utf-8")
-    elif patch_path.exists():
-        patch_path.unlink()  # clear a stale patch from a previous round
-
-    diff_path.unlink()
-
-    print(f"✅ Merged answer from {diff_path.name} into {a_path.name}  "
-          f"(backup: {a_path.with_suffix('.bak.md').name})")
-    if has_patch:
-        print(f"📄 Proposed code changes written to {patch_path.name} — review and apply "
-              f"to the repo yourself (do not trust it blindly).")
-    print(f"Then fill in <<<Feedback>>> in {a_path.name} and run: "
-          f"python agent_loop.py {a_path.name}  (re-zips the repo fresh)")
+    print(f"✅ Appended '<<<Agent Answer {ts}>>>' to {a_path.name}  (backup: {backup_path.name})")
+    print(f"   Apply the reply's <<<Code diff>>> to your code by hand if needed, then run: "
+          f"python agent_loop.py {a_path.name}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--template", type=Path, help="Generate the initial working doc")
-    parser.add_argument("a_file", type=Path, nargs="?", help="working doc (topic.md)")
-    parser.add_argument("diff_file", type=Path, nargs="?", help="agent reply to fold in (topic.diff.md)")
+    parser.add_argument("--new", nargs="?", const="", default=None,
+                        help="Create a new A document (defaults to <cwd-name>.md)")
+    parser.add_argument("a_file", type=Path, nargs="?", help="the A document (sometopic.md)")
+    parser.add_argument("diff_file", type=Path, nargs="?", help="agent reply (sometopic.diff.md)")
     args = parser.parse_args()
 
-    if args.template:
-        generate_template(args.template)
+    if args.new is not None:
+        target = Path(args.new) if args.new else Path(f"{Path.cwd().name}.md")
+        generate_new_template(target)
     elif args.a_file and not args.diff_file:
         produce_out(args.a_file)
     elif args.a_file and args.diff_file:
